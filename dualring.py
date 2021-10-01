@@ -1,6 +1,5 @@
 from charm.toolbox.pairinggroup import PairingGroup, ZR, G1, G2, GT, pair
 from charm.toolbox.ABEnc import ABEnc
-#from msp import MSP
 import hashlib
 import time
 
@@ -13,6 +12,7 @@ class DualRing(ABEnc):
         self.group = group_obj
         self.sk = {}
         self.pk = None
+        self.pp = {}
 
 
     def setup(self):
@@ -24,22 +24,10 @@ class DualRing(ABEnc):
             print('\nSetup algorithm:\n')
             
         g = self.group.random(G1)
-        h = self.group.random(G2)
-        hvec = []
-        tvec = [0, 1, 2, 1, 2, 1]
-        t = 12121
-        
-        # i = 5, l = 5
-        for i in range(0,6):
-            hvec.append(self.group.random(G2))
-            
-        Ft = hvec[0]
-        for i in range(1, 6):
-            Ft *= hvec[i] ** tvec[i]
-        
-        pp = {'g':g, 'h':h, 'hvec':hvec, 'Ft':Ft}
+        h = self.group.random(G1)
+        self.pp = {'g':g, 'h':h}
 
-        return pp
+        return self.pp
 
 
     def keygen(self, pp):
@@ -50,67 +38,57 @@ class DualRing(ABEnc):
         if debug:
             print('\nKey generation algorithm:\n')
         
-        g = pp['g']
-        h = pp['h']
+        g = self.pp['g']
+        h = self.pp['h']
 
         # (sk, pk)
-        SK = []
-        r = self.group.random(ZR)
-        sk = self.group.random(ZR)
-        tmp1 = g ** r
-        tmp2 = h ** sk * pp['Ft'] ** r
-        pk = g ** sk
-        SK.append(tmp1)
-        SK.append(tmp2)
+        x1 = self.group.random(ZR)
+        x2 = self.group.random(ZR)
+        y1 = self.group.random(ZR)
+        y2 = self.group.random(ZR)
+        kp0 = y1 * y2
+        kp1 = x1 * y2 + x2 * y1
+        kp2 = x1 * x2
+        pk = pair(g**kp2, g) * pair(g**kp1, h) * pair(h**kp0, h)
         
-        return SK, pk
+        self.sk = {'x1':x1, 'x2':x2, 'y1':y1, 'y2':y2, 'kp0':kp0, 'kp1':kp1, 'kp2':kp2}
+        self.pk = pk
+        
+        return self.sk, self.pk
        
         
     def sign(self, pp, sk, pk, m):
         """
         Generate a signature
-        pk: a set of public keys
-        sk: signer's private key
         """
-        g = pp['g']
-        h = pp['h']
+        g = self.pp['g']
+        h = self.pp['h']
+        r0 = self.group.random(ZR)
+        r1 = self.group.random(ZR)
+        r2 = self.group.random(ZR)
         
-        # step 1
-        cs = [1]
+        c_list = [1]
         for i in range(1,len(pk)):
-            cs.append(self.group.random(ZR))
-            
-        rhat1 = self.group.random(ZR)
-        rhat2 = self.group.random(ZR)
-        rhat = rhat1 + rhat2
+            c_list.append(self.group.random(ZR))
         tmp = 1
-        for j in range(1, len(pk)):
-            tmp *= pk[j] ** cs[j]
-        R = pair(tmp, h) / pair(g ** rhat, pp['Ft'])    
+        start = time.time()
+        for i in range(1,len(pk)):
+            tmp *= pk[i] ** c_list[i]
+        K = pair(g**r2,g) * pair(g**r1,h) * pair(h**r0, h) * tmp
         
-        # step 2
+        
         sha256 = hashlib.new('sha256')
-        sha256.update(self.group.serialize(R)) 
+        sha256.update(self.group.serialize(K))  
         c_ = sha256.hexdigest()
         seed = str(c_) + m
-        tmp = 1
-        for i in range(0,len(pk)):
-            tmp *= pk[i]
-        sha256 = hashlib.new('sha256')
-        sha256.update(self.group.serialize(tmp)) 
-        c_ = sha256.hexdigest()
-        seed = seed + str(c_)     
         c = self.group.hash(seed, ZR)
-        for j in range(1, len(pk)):
-           c = c + cs[j]
-        cs[0] = c
-           
-        # step 3
-        sigma1 = sk[1] ** c * pp['Ft'] ** rhat1
-        sigma2 = g**rhat2 / (sk[0] ** c)
-        
-        
-        sig = [sigma1, sigma2, cs]      
+        tmp2 = 1
+        for i in range(1,len(pk)):
+            tmp2 += c_list[i]  
+        c_list[0] = c + tmp2
+        r0_bar = r0 - c_list[0] * sk['kp0']
+        r1_bar = pair(g**(r1-c_list[0]*sk['kp1']),h) * pair(g**(r2-c_list[0]*sk['kp2']),g)
+        sig = {'r0_bar':r0_bar, 'r1_bar':r1_bar, 'c_list':c_list}        
         
         return sig
 
@@ -119,41 +97,27 @@ class DualRing(ABEnc):
         """
         Verify a signature
         """
-        g = pp['g']
-        h = pp['h']
-        sigma1 = sig[0]
-        sigma2 = sig[1]
-        cs = sig[2]
+        g = self.pp['g']
+        h = self.pp['h']
         
-        A = pair(g, sigma1)
-        B = pair(sigma2, pp['Ft'])
-        tmp = pk[0] ** cs[0]
-        for j in range(1, len(pk)):
-            tmp *= pk[j] ** cs[j]
-        C = pair(tmp, h)
-        Rprime = C / (A * B)
+        tmp3 = 1
+        for i in range(0,len(pk)):
+            tmp3 *= pk[i] ** sig['c_list'][i]        
+        K_prime = pair(h**sig['r0_bar'], h) * sig['r1_bar'] * tmp3
+        
         sha256 = hashlib.new('sha256')
-        sha256.update(self.group.serialize(Rprime)) 
+        sha256.update(self.group.serialize(K_prime))  
         c_ = sha256.hexdigest()
         seed = str(c_) + m
-        tmp = 1
-        for i in range(0,len(pk)):
-            tmp *= pk[i]
-        sha256 = hashlib.new('sha256')
-        sha256.update(self.group.serialize(tmp)) 
-        c_ = sha256.hexdigest()
-        seed = seed + str(c_)        
-        cprime = self.group.hash(seed, ZR)
+        c_prime = self.group.hash(seed, ZR)
         
-        tmp1 = 0
-        for j in range(1, len(pk)):
-            tmp1 += cs[j]
-        
-        if (cprime == cs[0] - tmp1):
+        tmp4 = 1
+        for i in range(1,len(pk)):
+            tmp4 += sig['c_list'][i]
+        if (c_prime == sig['c_list'][0]-tmp4):
             return 0
         else:
             return 1
-            
             
         return 0
         
